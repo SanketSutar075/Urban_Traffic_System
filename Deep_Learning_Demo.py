@@ -1,3 +1,6 @@
+import gc
+import os
+import tempfile
 """
 TrafficIQ v7.0 - Smart Traffic Signalling + AQI Prediction
 ULTRA REVAMP — Cyberpunk Dark HUD + 6 New Features
@@ -8,10 +11,6 @@ pip install streamlit opencv-python ultralytics scikit-learn psutil matplotlib p
 
 import streamlit as st
 import cv2, numpy as np, pandas as pd
-try:
-    from PIL import Image as _PIL_Image
-except ImportError:
-    _PIL_Image = None
 import matplotlib; matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import time, random, math, base64, json
@@ -535,15 +534,17 @@ ROUTES = ["Via Highway NH-48", "Via Ring Road", "Via Bypass MH-4", "Via City Cen
 # ─── SESSION STATE ─────────────────────────────────────────────────────────────
 def _init():
     D = dict(
-        history=deque(maxlen=150), running=False, frame_no=0, yolo_model=None, cap=None,
-        prev_c=0, prev_b=0, peak=0, frames_done=0, cnn_feats=deque(maxlen=40),
+        history=deque(maxlen=300), running=False, frame_no=0, yolo_model=None, cap=None,
+        prev_c=0, prev_b=0, peak=0, frames_done=0, cnn_feats=deque(maxlen=80),
         lstm_last=120.0, rnn_last=8.0, frame_skip=3,
         emergency_active=False, emergency_type="", emergency_countdown=0, emergency_intersection=0,
-        green_wave_mode=False, co2_saved=0.0, efficiency_scores=deque(maxlen=60),
+        green_wave_mode=False, co2_saved=0.0, efficiency_scores=deque(maxlen=120),
         total_vehicles_cleared=0, idle_time_saved=0.0, incident_detected=False, prev_total=0,
         session_start=datetime.now(),
+        vid_path=None, out_path=None, vid_done=False,
+        vid_bytes=None, vid_stats=None,
         # NEW v7.0
-        is_upload=False, speed_history=deque(maxlen=50), avg_speed=42.0,
+        speed_history=deque(maxlen=100), avg_speed=42.0,
         flow_rate=0.0, congestion_index=0,
         incident_log=deque(maxlen=50),
         pred_accuracy={"KNN": 87.2, "RF": 91.4, "GBM": 93.1, "ANN": 82.6},
@@ -563,179 +564,71 @@ def _load_yolo():
     try: return YOLO("yolov8n.pt")
     except: return None
 
-CAR_IDS = {2, 5, 7}; BIKE_IDS = {1, 3}  # car,bus,truck / bicycle,motorcycle
+CAR_IDS = {2}; BIKE_IDS = {1, 3}
+CAR_IDS_EX = {2,5,7}; BIKE_IDS_EX = {1,3}; ALL_VEH_IDS = CAR_IDS_EX | BIKE_IDS_EX
 
 # ─── VEHICLE DETECTION ───────────────────────────────────────────────────────
-# COCO class IDs — all common road vehicles
-CAR_IDS_EX  = {2, 5, 7}   # car=2, bus=5, truck=7
-BIKE_IDS_EX = {1, 3}      # bicycle=1, motorcycle=3
-VEH_LABELS  = {1:"BIKE", 2:"CAR", 3:"MOTO", 5:"BUS", 7:"TRUCK"}
-VEH_COLORS  = {1:(255,180,0), 2:(0,220,100), 3:(255,100,0), 5:(0,180,255), 7:(180,0,255)}
-ALL_VEH_IDS = CAR_IDS_EX | BIKE_IDS_EX
 
-
-def _run_yolo_on_tile(model, tile, ox, oy, conf=0.20):
-    """Run YOLO on a single tile, return boxes shifted to original frame coords."""
-    res = model(tile, verbose=False, conf=conf, iou=0.40,
-                imgsz=640, max_det=300, agnostic_nms=True)[0]
-    boxes = []
-    for box in res.boxes:
-        cid = int(box.cls[0])
-        if cid not in ALL_VEH_IDS:
-            continue
-        cf = float(box.conf[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-        # shift back to original frame coordinates
-        boxes.append((x1+ox, y1+oy, x2+ox, y2+oy, cid, cf))
-    return boxes
-
+def _run_yolo_on_tile(model, tile, conf=0.20):
+    try:
+        res = model(tile, verbose=False, conf=conf, iou=0.40, imgsz=640, max_det=300, agnostic_nms=True)[0]
+        return [(int(b.cls[0]),float(b.conf[0]),*map(int,b.xyxy[0].cpu().numpy()))
+                for b in res.boxes if int(b.cls[0]) in ALL_VEH_IDS]
+    except: return []
 
 def _nms_boxes(boxes, iou_thr=0.45):
-    """Simple class-agnostic NMS to remove duplicates from tiled inference."""
-    if not boxes:
-        return []
-    boxes = sorted(boxes, key=lambda b: b[5], reverse=True)  # sort by conf desc
-    kept = []
-    suppressed = [False] * len(boxes)
+    if not boxes: return []
+    boxes = sorted(boxes, key=lambda b: b[1], reverse=True)
+    sup=[False]*len(boxes); kept=[]
     for i in range(len(boxes)):
-        if suppressed[i]:
-            continue
-        kept.append(boxes[i])
-        x1i, y1i, x2i, y2i = boxes[i][:4]
-        ai = max(0, (x2i-x1i)) * max(0, (y2i-y1i))
-        for j in range(i+1, len(boxes)):
-            if suppressed[j]: continue
-            x1j, y1j, x2j, y2j = boxes[j][:4]
-            ix1, iy1 = max(x1i, x1j), max(y1i, y1j)
-            ix2, iy2 = min(x2i, x2j), min(y2i, y2j)
-            inter = max(0, ix2-ix1) * max(0, iy2-iy1)
-            if inter == 0: continue
-            aj = max(0, (x2j-x1j)) * max(0, (y2j-y1j))
-            iou = inter / (ai + aj - inter + 1e-6)
-            if iou > iou_thr:
-                suppressed[j] = True
+        if sup[i]: continue
+        kept.append(boxes[i]); _,_,x1i,y1i,x2i,y2i=boxes[i]; ai=max(0,x2i-x1i)*max(0,y2i-y1i)
+        for j in range(i+1,len(boxes)):
+            if sup[j]: continue
+            _,_,x1j,y1j,x2j,y2j=boxes[j]
+            inter=max(0,min(x2i,x2j)-max(x1i,x1j))*max(0,min(y2i,y2j)-max(y1i,y1j))
+            if inter>0 and inter/(max(1,ai+max(0,x2j-x1j)*max(0,y2j-y1j)-inter))>iou_thr: sup[j]=True
     return kept
 
-
 def detect_vehicles(model, frame):
-    """
-    SAHI-style tiled detection:
-    • Full frame  @ 640  — catches large/mid vehicles
-    • Top 55% tile @ 640  — catches distant/small vehicles in background
-    • Bottom 55% tile @ 640 — catches foreground vehicles cleanly
-    • Left & Right halves (with 20% overlap) — catches side vehicles
-    All results merged with custom NMS → no duplicates.
-    """
-    H0, W0 = frame.shape[:2]
-    out    = frame.copy()
-    all_boxes = []
+    small = cv2.resize(frame, (416, 416))
+    res = model(small, verbose=False, conf=0.40, imgsz=416)[0]
+    cars = bikes = 0; out = frame.copy(); H0, W0 = frame.shape[:2]; sx, sy = W0/416, H0/416
+    for box in res.boxes:
+        cid = int(box.cls[0]); cf = float(box.conf[0])
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+        x1, y1, x2, y2 = int(x1*sx), int(y1*sy), int(x2*sx), int(y2*sy)
+        if cid in CAR_IDS: cars += 1; col, lb = (0, 220, 100), f"CAR {cf:.2f}"
+        elif cid in BIKE_IDS: bikes += 1; col, lb = (255, 140, 0), f"BIKE {cf:.2f}"
+        else: continue
+        cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
+        cv2.rectangle(out, (x1, y1-20), (x1+len(lb)*8+4, y1), col, -1)
+        cv2.putText(out, lb, (x1+2, y1-4), cv2.FONT_HERSHEY_SIMPLEX, .45, (0, 0, 0), 1)
+    _hud(out, cars, bikes); return out, cars, bikes
 
-    # ── Tile definitions: (crop_y1, crop_y2, crop_x1, crop_x2) ──────────────
-    h_split = int(H0 * 0.55)   # horizontal split point
-    w_split = int(W0 * 0.55)   # vertical split point
-    ov_h    = int(H0 * 0.10)   # 10% vertical overlap
-    ov_w    = int(W0 * 0.10)   # 10% horizontal overlap
-
-    tiles = [
-        # (y1, y2, x1, x2, label, conf_override)
-        (0,       H0,         0,       W0,          "full",  0.20),   # full frame — main pass
-        (0,       h_split+ov_h, 0,     W0,          "top",   0.15),   # top half — distant vehicles, lower conf
-        (h_split-ov_h, H0,   0,       W0,          "bot",   0.20),   # bottom half — foreground
-        (0,       H0,         0,       w_split+ov_w,"left",  0.18),   # left half
-        (0,       H0,         w_split-ov_w, W0,    "right",  0.18),   # right half
-    ]
-
-    for (y1, y2, x1, x2, lbl, cf_thr) in tiles:
-        y1c, y2c = max(0,y1), min(H0,y2)
-        x1c, x2c = max(0,x1), min(W0,x2)
-        tile = frame[y1c:y2c, x1c:x2c]
-        if tile.size == 0: continue
-        # Upscale tiny tiles so YOLO sees them at a reasonable resolution
-        th, tw = tile.shape[:2]
-        if tw < 320 or th < 240:
-            tile = cv2.resize(tile, (max(320,tw), max(240,th)))
-        # Adjust offset when tile was upscaled
-        scale_x = (x2c-x1c) / max(1, tile.shape[1]) if tile.shape[1] != (x2c-x1c) else 1.0
-        scale_y = (y2c-y1c) / max(1, tile.shape[0]) if tile.shape[0] != (y2c-y1c) else 1.0
-
-        raw = _run_yolo_on_tile(model, tile, 0, 0, conf=cf_thr)
-        for (bx1, by1, bx2, by2, cid, conf) in raw:
-            # map back to full-frame coords
-            fx1 = x1c + int(bx1 * scale_x)
-            fy1 = y1c + int(by1 * scale_y)
-            fx2 = x1c + int(bx2 * scale_x)
-            fy2 = y1c + int(by2 * scale_y)
-            all_boxes.append((
-                max(0,fx1), max(0,fy1),
-                min(W0-1,fx2), min(H0-1,fy2),
-                cid, conf
-            ))
-
-    # Merge all tiles with NMS
-    final = _nms_boxes(all_boxes, iou_thr=0.40)
-
-    cars = bikes = 0
-    for (x1, y1, x2, y2, cid, cf) in final:
-        if cid in CAR_IDS_EX:   cars  += 1
-        elif cid in BIKE_IDS_EX: bikes += 1
-
-        col      = VEH_COLORS.get(cid, (200,200,200))
-        lb       = f"{VEH_LABELS.get(cid,'VEH')} {cf:.2f}"
-        box_area = max(1,(x2-x1)) * max(1,(y2-y1))
-        thick    = 1 if box_area < 1200 else 2
-
-        cv2.rectangle(out, (x1,y1), (x2,y2), col, thick)
-        if box_area > 400:   # label only on boxes large enough to read
-            lbl_y = max(y1-4, 14)
-            cv2.rectangle(out,(x1,lbl_y-12),(x1+len(lb)*7+4,lbl_y+2),col,-1)
-            cv2.putText(out,lb,(x1+2,lbl_y),cv2.FONT_HERSHEY_SIMPLEX,.35,(0,0,0),1)
-
-    _hud(out, cars, bikes)
-    return out, cars, bikes
 
 def detect_vehicles_fast(model, frame):
-    """Lightweight single-pass detection for webcam real-time use.
-    imgsz=640, no tiling → low latency, ~15-25 FPS on CPU.
-    """
-    H0, W0 = frame.shape[:2]
-    out = frame.copy()
-
-    res = model(
-        frame,
-        verbose=False,
-        conf=0.25,
-        iou=0.45,
-        imgsz=640,
-        max_det=200,
-        agnostic_nms=True,
-    )[0]
-
+    """Lightweight single-pass detection for webcam — no tiling, low latency."""
+    H0, W0 = frame.shape[:2]; out = frame.copy()
+    res = model(frame, verbose=False, conf=0.25, iou=0.45,
+                imgsz=640, max_det=200, agnostic_nms=True)[0]
     cars = bikes = 0
     for box in res.boxes:
         cid = int(box.cls[0])
-        if cid not in ALL_VEH_IDS:
-            continue
+        if cid not in ALL_VEH_IDS: continue
         cf = float(box.conf[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(W0-1, x2), min(H0-1, y2)
-
-        if cid in CAR_IDS_EX:   cars  += 1
-        elif cid in BIKE_IDS_EX: bikes += 1
-
-        col      = VEH_COLORS.get(cid, (200, 200, 200))
-        lb       = f"{VEH_LABELS.get(cid,'VEH')} {cf:.2f}"
-        box_area = max(1, (x2-x1)) * max(1, (y2-y1))
-        thick    = 1 if box_area < 2000 else 2
-
-        cv2.rectangle(out, (x1, y1), (x2, y2), col, thick)
-        if box_area > 500:
-            lbl_y = max(y1-4, 14)
-            cv2.rectangle(out, (x1, lbl_y-12), (x1+len(lb)*7+4, lbl_y+2), col, -1)
-            cv2.putText(out, lb, (x1+2, lbl_y), cv2.FONT_HERSHEY_SIMPLEX, .38, (0, 0, 0), 1)
-
-    _hud(out, cars, bikes)
-    return out, cars, bikes
+        x1,y1,x2,y2 = map(int, box.xyxy[0].cpu().numpy())
+        x1,y1 = max(0,x1),max(0,y1); x2,y2 = min(W0-1,x2),min(H0-1,y2)
+        if cid in CAR_IDS_EX: cars+=1
+        elif cid in BIKE_IDS_EX: bikes+=1
+        col=VEH_COLORS.get(cid,(200,200,200)); lb=f"{VEH_LABELS.get(cid,'VEH')} {cf:.2f}"
+        area=max(1,(x2-x1))*max(1,(y2-y1)); thick=1 if area<2000 else 2
+        cv2.rectangle(out,(x1,y1),(x2,y2),col,thick)
+        if area>500:
+            ly=max(y1-4,14)
+            cv2.rectangle(out,(x1,ly-12),(x1+len(lb)*7+4,ly+2),col,-1)
+            cv2.putText(out,lb,(x1+2,ly),cv2.FONT_HERSHEY_SIMPLEX,.38,(0,0,0),1)
+    _hud(out,cars,bikes); return out,cars,bikes
 
 # ─── DEMO FRAME ───────────────────────────────────────────────────────────────
 _vpool = []
@@ -859,19 +752,21 @@ def demo_frame(tc, tb, night=False, emergency=False):
 
 def _hud_light(f, c, b, night=False):
     overlay = f.copy()
-    cv2.rectangle(overlay, (0, 0), (230, 68), (8, 12, 20), -1)
-    cv2.addWeighted(overlay, .80, f, .20, 0, f)
-    cv2.rectangle(f, (0, 0), (230, 68), (0, 200, 80), 2)
-    cv2.putText(f, f"CARS/BUS/TRK: {c}", (6, 24), cv2.FONT_HERSHEY_SIMPLEX, .52, (0, 220, 90), 2)
-    cv2.putText(f, f"BIKE/MOTO   : {b}", (6, 52), cv2.FONT_HERSHEY_SIMPLEX, .52, (255, 140, 0), 2)
+    hbg = (8, 12, 20) if night else (240, 245, 255)
+    cv2.rectangle(overlay, (0, 0), (218, 64), hbg, -1)
+    cv2.addWeighted(overlay, .75, f, .25, 0, f)
+    cv2.rectangle(f, (0, 0), (218, 64), (0, 200, 80) if night else (255, 140, 0), 2)
+    tc2 = (0, 255, 120) if night else (0, 150, 50)
+    bc = (255, 140, 40) if night else (200, 80, 0)
+    cv2.putText(f, f"CARS : {c}", (7, 22), cv2.FONT_HERSHEY_SIMPLEX, .60, tc2, 2)
+    cv2.putText(f, f"BIKES: {b}", (7, 48), cv2.FONT_HERSHEY_SIMPLEX, .60, bc, 2)
 
 def _hud(f, c, b):
-    overlay = f.copy()
-    cv2.rectangle(overlay, (0, 0), (230, 68), (10, 14, 22), -1)
-    cv2.addWeighted(overlay, .80, f, .20, 0, f)
-    cv2.rectangle(f, (0, 0), (230, 68), (0, 200, 80), 2)
-    cv2.putText(f, f"CARS/BUS/TRK: {c}", (6, 24), cv2.FONT_HERSHEY_SIMPLEX, .52, (0, 220, 90), 2)
-    cv2.putText(f, f"BIKE/MOTO   : {b}", (6, 52), cv2.FONT_HERSHEY_SIMPLEX, .52, (255, 140, 0), 2)
+    overlay = f.copy(); cv2.rectangle(overlay, (0, 0), (220, 64), (240, 245, 255), -1)
+    cv2.addWeighted(overlay, .75, f, .25, 0, f)
+    cv2.rectangle(f, (0, 0), (220, 64), (255, 140, 0), 2)
+    cv2.putText(f, f"CARS : {c}", (7, 22), cv2.FONT_HERSHEY_SIMPLEX, .60, (0, 150, 50), 2)
+    cv2.putText(f, f"BIKES: {b}", (7, 48), cv2.FONT_HERSHEY_SIMPLEX, .60, (200, 80, 0), 2)
 
 # ─── LOGIC FUNCTIONS ─────────────────────────────────────────────────────────
 def classify_traffic(n):
@@ -1443,16 +1338,9 @@ with st.sidebar:
     if not SK_AVAILABLE: st.warning("pip install scikit-learn")
     st.divider()
 
-    src = st.radio("Input Source", ["Demo Mode", "Webcam (Browser)", "Upload Video"], index=0)
-    vid_file   = None
-    cam_img    = None
-    if "Webcam" in src:
-        st.markdown("**📷 Browser Camera**")
-        cam_img = st.camera_input("Point camera at traffic", label_visibility="collapsed")
-        st.caption("✅ No driver needed — uses browser camera directly")
-    if "Upload" in src:
-        vid_file = st.file_uploader("MP4 / AVI / MOV", type=["mp4", "avi", "mov"])
-        st.caption("💡 Frame skip=2 for best detection on uploaded video")
+    src = st.radio("Input Source", ["Demo Mode", "Webcam", "Upload Video"], index=0)
+    vid_file = None
+    if "Upload" in src: vid_file = st.file_uploader("MP4/AVI/MOV", type=["mp4", "avi", "mov"])
     st.divider()
 
     aqi_src = st.radio("AQI Source", ["Manual", "Auto-Simulate"])
@@ -1486,8 +1374,7 @@ with st.sidebar:
     st.divider()
 
     vid_quality = st.slider("Video Quality", 30, 90, 60)
-    frame_skip = st.slider("YOLO every N frames", 1, 6, 2,
-        help="1=max accuracy (slow), 2=balanced (recommended for upload), 3+=fast")
+    frame_skip = st.slider("YOLO every N frames", 1, 8, 3)
     st.session_state.frame_skip = frame_skip
     st.divider()
 
@@ -1507,6 +1394,10 @@ with st.sidebar:
                 b64 = base64.b64encode(html.encode()).decode()
                 st.markdown(f'<a href="data:text/html;base64,{b64}" download="trafficiq_v7_report.html" style="color:#00d4ff;font-family:monospace;font-size:.75rem;font-weight:700">⬇ Report</a>', unsafe_allow_html=True)
             else: st.info("No data yet.")
+    _svb = getattr(st.session_state,"vid_bytes",None)
+    if _svb:
+        _sb64=base64.b64encode(_svb).decode(); _ssz=round(len(_svb)/1024/1024,1)
+        st.markdown(f'<a href="data:video/mp4;base64,{_sb64}" download="trafficiq_detected.mp4" style="display:block;margin:5px 0;padding:9px;text-align:center;background:rgba(0,212,255,.1);border:1px solid rgba(0,212,255,.4);color:#00d4ff;font-family:Orbitron,monospace;font-size:.65rem;font-weight:700;border-radius:6px;text-decoration:none">⬇ DOWNLOAD VIDEO ({_ssz} MB)</a>',unsafe_allow_html=True)
     st.caption("TrafficIQ v7.0 | Sanket Sutar | 2025-26")
 
 # ════════════════════════════════════════════════════════════════════
@@ -1683,7 +1574,9 @@ with at_tabs[11]: st.markdown(f'<div class="info-card">{justifications["hm"]}</d
 # ════════════════════════════════════════════════════════════════════
 if start_btn:
     st.session_state.running = True; st.session_state.frame_no = 0
-    st.session_state.cam_img_bytes = None
+    st.session_state.vid_path = None; st.session_state.out_path = None
+    st.session_state.vid_done = False; st.session_state.vid_bytes = None
+    st.session_state.vid_stats = None
     st.session_state.history.clear(); st.session_state.peak = 0
     st.session_state.frames_done = 0; st.session_state.cnn_feats.clear()
     st.session_state.co2_saved = 0.0; st.session_state.efficiency_scores.clear()
@@ -1694,6 +1587,9 @@ if start_btn:
     st.session_state.flow_rate = 0.0; st.session_state.total_alerts = 0
     st.session_state.heatmap_data = np.zeros((10, 14), dtype=float)
     _vpool.clear()
+    # Clear upload video state
+    for _k in ['vid_path','out_path','vid_done','vid_bytes','vid_stats']:
+        if _k in st.session_state: del st.session_state[_k]
 
 if stop_btn:
     st.session_state.running = False
@@ -1703,223 +1599,343 @@ if reset_btn:
     for k in list(st.session_state.keys()): del st.session_state[k]
     _vpool.clear(); st.rerun()
 
+
+# ════════════════════════════════════════════════════════════════════
+#  UPLOAD VIDEO PROCESSING — LIVE DETECTION
+# ════════════════════════════════════════════════════════════════════
+def process_video(vid_path, model, fskip, _vid_slot, _prog, _stat):
+    """Process video: show LIVE frames every 4 frames. Returns (path, bytes, stats)."""
+    global _veh_type_counts
+    _veh_type_counts.clear()
+    cap = cv2.VideoCapture(vid_path)
+    fps_v = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    w_in  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h_in  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    sc = min(1.0, 640/max(w_in,1)); ow,oh = int(w_in*sc), int(h_in*sc)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4"); tmp.close(); raw=tmp.name
+    writer=None
+    for fc in ["avc1","H264","mp4v","XVID"]:
+        ww=cv2.VideoWriter(raw,cv2.VideoWriter_fourcc(*fc),fps_v,(ow,oh))
+        if ww.isOpened(): writer=ww; break
+    if not writer: writer=cv2.VideoWriter(raw,cv2.VideoWriter_fourcc(*"mp4v"),fps_v,(ow,oh))
+    prev_c=prev_b=0; all_c=[]; all_b=[]; fn=0
+    while True:
+        ret,frame=cap.read()
+        if not ret: break
+        if fn%fskip==0 and model:
+            proc,c,b=detect_vehicles(model,frame); prev_c,prev_b=c,b
+        else:
+            c,b=prev_c,prev_b; proc=frame.copy(); _hud(proc,c,b)
+        all_c.append(c); all_b.append(b)
+        writer.write(cv2.resize(proc,(ow,oh)))
+        # ── LIVE PREVIEW every 4 frames ──
+        if fn%4==0:
+            rgb=cv2.cvtColor(proc,cv2.COLOR_BGR2RGB)
+            if rgb.shape[1]>560: s2=560/rgb.shape[1]; rgb=cv2.resize(rgb,(560,int(rgb.shape[0]*s2)))
+            _vid_slot.image(rgb,channels="RGB",use_container_width=True,clamp=True,output_format="JPEG")
+        if fn%6==0:
+            pct=min(fn/max(total,1),1.0); _prog.progress(pct)
+            _stat.markdown(f'<div style="font-family:monospace;font-size:.8rem;padding:7px 12px;background:rgba(0,212,255,.06);border-left:3px solid #00d4ff;border-radius:0 6px 6px 0">🚗 <b style="color:#00d4ff">{fn}/{total}</b> | Cars:<b style="color:#00ff88"> {c}</b> | Bikes:<b style="color:#ff6b00"> {b}</b> | <b style="color:#ffd700">{int(pct*100)}%</b></div>',unsafe_allow_html=True)
+        fn+=1
+    cap.release(); writer.release()
+    _prog.progress(1.0); _stat.info("⚙️ Converting...")
+    final=raw; ffmpeg=shutil.which("ffmpeg")
+    if ffmpeg:
+        compat=raw.replace(".mp4","_c.mp4")
+        r=subprocess.run([ffmpeg,"-y","-i",raw,"-vcodec","libx264","-crf","26","-preset","ultrafast","-pix_fmt","yuv420p","-movflags","+faststart",compat],capture_output=True,timeout=300)
+        if r.returncode==0 and os.path.exists(compat):
+            final=compat
+            try: os.remove(raw)
+            except: pass
+    _stat.empty(); _prog.empty()
+    with open(final,"rb") as vf: vbytes=vf.read()
+    stats={"frames":fn,"avg_cars":round(sum(all_c)/max(len(all_c),1),1),"avg_bikes":round(sum(all_b)/max(len(all_b),1),1),"avg_total":round((sum(all_c)+sum(all_b))/max(fn,1),1),"peak":max((a+b for a,b in zip(all_c,all_b)),default=0),"fps":round(fps_v,1),"size":f"{ow}x{oh}","veh_types":dict(_veh_type_counts)}
+    return final, vbytes, stats
+
 # ════════════════════════════════════════════════════════════════════
 #  MAIN DETECTION LOOP
 # ════════════════════════════════════════════════════════════════════
 if st.session_state.running:
-    is_webcam_mode = "Webcam" in src
     is_upload_mode = "Upload" in src
     demo_mode = ("Demo" in src) or not YOLO_AVAILABLE
 
+    # Load YOLO if needed
     if not demo_mode and st.session_state.yolo_model is None:
         st.session_state.yolo_model = _load_yolo()
         if st.session_state.yolo_model is None: demo_mode = True
 
-    # Webcam mode uses st.camera_input — no OpenCV cap needed
-    if not demo_mode and not is_webcam_mode and st.session_state.cap is None:
-        if "Upload" in src and vid_file:
-            import tempfile, os
-            ext = os.path.splitext(vid_file.name)[-1].lower() or ".mp4"
-            tf = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
-            tf.write(vid_file.read()); tf.flush(); tf.close()
-            cap = cv2.VideoCapture(tf.name)
-            if not cap.isOpened():
-                st.error(f"Cannot open: {vid_file.name}"); demo_mode = True
-            else:
-                fps  = cap.get(cv2.CAP_PROP_FPS)
-                w_v  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                h_v  = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                tot  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                st.sidebar.success(f"✅ {w_v}×{h_v} @ {fps:.1f}fps — {tot} frames")
-                st.sidebar.caption("🔍 Tiled detection: 5 tiles/frame → better far-vehicle detection")
-                st.session_state.cap = cap; st.session_state.is_upload = True
-        else: demo_mode = True
-
     fskip = st.session_state.frame_skip
-    FRAMES_PER_RUN = 3 if ("Upload" in src) else 1  # 1 for webcam/demo per rerun
 
-    for _ in range(FRAMES_PER_RUN):
-        if not st.session_state.running: break
-        n = st.session_state.frame_no; st.session_state.frame_no = n+1; st.session_state.frames_done += 1
-        night = night_override or is_night()
+    # ══════════════════════════════════════════════════════════════
+    #  UPLOAD VIDEO MODE — stable blocking process_video()
+    # ══════════════════════════════════════════════════════════════
+    if is_upload_mode and not demo_mode:
+        _vp = st.session_state.get("vid_path")
+        _vd = st.session_state.get("vid_done", False)
+        _vb = st.session_state.get("vid_bytes")
 
-        if st.session_state.emergency_active:
-            st.session_state.emergency_countdown -= 1
-            if st.session_state.emergency_countdown <= 0:
-                st.session_state.emergency_active = False; st.session_state.emergency_type = ""
+        # ── STEP 1: Save uploaded file to disk ONCE ──────────────
+        if not _vp and vid_file is not None:
+            import tempfile as _tmp2, os as _os2
+            _ext = _os2.path.splitext(vid_file.name)[-1].lower() or ".mp4"
+            _tf  = _tmp2.NamedTemporaryFile(delete=False, suffix=_ext)
+            _tf.write(vid_file.read()); _tf.flush(); _tf.close()
+            st.session_state.vid_path = _tf.name
+            _vp = _tf.name
+            # Show video info
+            _ci = cv2.VideoCapture(_vp)
+            if _ci.isOpened():
+                _fw = int(_ci.get(cv2.CAP_PROP_FRAME_WIDTH))
+                _fh = int(_ci.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                _ff = _ci.get(cv2.CAP_PROP_FPS)
+                _ft = int(_ci.get(cv2.CAP_PROP_FRAME_COUNT))
+                st.sidebar.success(f"✅ {_fw}×{_fh} @ {_ff:.0f}fps — {_ft} frames")
+                _ci.release()
+
+        # ── STEP 2: Process video (blocking, shows live frames) ───
+        if _vp and not _vd:
+            _prog = st.progress(0, text="🔄 Loading video...")
+            _stat = st.empty()
+            import gc as _gc
+            out_p, vbytes, vstats = process_video(
+                _vp, st.session_state.yolo_model, fskip, vid_slot, _prog, _stat)
+            st.session_state.out_path  = out_p
+            st.session_state.vid_bytes = vbytes
+            st.session_state.vid_stats = vstats
+            st.session_state.vid_done  = True
+            st.session_state.peak = max(st.session_state.peak, vstats.get("peak", 0))
+            st.session_state.running = False
+            _prog.empty(); _stat.empty(); _gc.collect()
+            st.rerun()
+
+        # ── STEP 3: Done — show player + download ─────────────────
+        elif _vd and _vb:
+            vid_slot.video(_vb)
+            _vs  = st.session_state.get("vid_stats", {})
+            _sz  = _vs.get("size", round(len(_vb)/1024/1024, 1))
+            _b64 = base64.b64encode(_vb).decode()
+            # Big download button
+            st.markdown(f'''<div style="text-align:center;margin:14px 0">
+              <a href="data:video/mp4;base64,{_b64}" download="trafficiq_annotated.mp4"
+                 style="display:inline-block;background:linear-gradient(135deg,#ff6b00,#ff8c00);
+                        color:#000;font-family:Orbitron,monospace;font-size:.8rem;
+                        font-weight:700;padding:14px 36px;border-radius:8px;
+                        text-decoration:none;letter-spacing:2px;
+                        box-shadow:0 4px 20px rgba(255,107,0,.5)">
+                ⬇ DOWNLOAD ANNOTATED VIDEO ({_sz} MB)
+              </a></div>''', unsafe_allow_html=True)
+            # Sidebar download
+            with st.sidebar:
+                st.markdown(
+                    f'<a href="data:video/mp4;base64,{_b64}" download="trafficiq_annotated.mp4" '
+                    f'style="display:block;text-align:center;background:rgba(255,107,0,.12);'
+                    f'border:1px solid rgba(255,107,0,.3);color:#ff6b00;border-radius:6px;'
+                    f'padding:8px 4px;font-family:monospace;font-size:.72rem;font-weight:700;'
+                    f'text-decoration:none;margin:4px 0">⬇ DOWNLOAD VIDEO ({_sz} MB)</a>',
+                    unsafe_allow_html=True)
+            # Stats breakdown
+            st.markdown(f'''<div style="background:rgba(13,20,33,.9);border:1px solid
+              rgba(255,107,0,.2);border-radius:12px;padding:16px 20px;margin:10px 0">
+              <div style="font-family:Share Tech Mono,monospace;font-size:.65rem;color:#ff6b00;
+                          letter-spacing:2px;margin-bottom:12px">VEHICLE TYPE BREAKDOWN</div>
+              <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;text-align:center">
+                <div><div style="font-family:Orbitron,monospace;font-size:1.6rem;font-weight:800;
+                  color:#00ff88">{_vs.get("avg_cars",0):.1f}</div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.55rem;color:#4a5568">
+                  AVG CARS</div></div>
+                <div><div style="font-family:Orbitron,monospace;font-size:1.6rem;font-weight:800;
+                  color:#ff6b00">{_vs.get("avg_bikes",0):.1f}</div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.55rem;color:#4a5568">
+                  AVG BIKES</div></div>
+                <div><div style="font-family:Orbitron,monospace;font-size:1.6rem;font-weight:800;
+                  color:#00d4ff">{_vs.get("frames",0)}</div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.55rem;color:#4a5568">
+                  FRAMES</div></div>
+                <div><div style="font-family:Orbitron,monospace;font-size:1.6rem;font-weight:800;
+                  color:#ffd700">{_vs.get("peak",0)}</div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.55rem;color:#4a5568">
+                  PEAK VEH</div></div>
+              </div></div>''', unsafe_allow_html=True)
+
+        # ── No file uploaded yet ────────────────────────────────────
+        elif not _vp:
+            _ph = np.full((240, 560, 3), 8, dtype=np.uint8)
+            cv2.putText(_ph, "📁 Upload a video in the sidebar",
+                        (50, 90), cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 180, 255), 2)
+            cv2.putText(_ph, "then press   START DETECTION",
+                        (90, 140), cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 120, 180), 1)
+            vid_slot.image(cv2.cvtColor(_ph, cv2.COLOR_BGR2RGB),
+                           channels="RGB", use_container_width=True)
+            st.session_state.running = False
+
+    # ══════════════════════════════════════════════════════════════
+    #  DEMO / WEBCAM MODE — smooth frame loop with st.rerun()
+    # ══════════════════════════════════════════════════════════════
+    else:
+        for _ in range(8):
+            if not st.session_state.running: break
+            n = st.session_state.frame_no; st.session_state.frame_no = n+1
+            st.session_state.frames_done += 1
+            night = night_override or is_night()
+
+            if st.session_state.emergency_active:
+                st.session_state.emergency_countdown -= 1
+                if st.session_state.emergency_countdown <= 0:
+                    st.session_state.emergency_active = False
+                    st.session_state.emergency_type = ""
+                    st.session_state.incident_log.appendleft({
+                        "time": datetime.now().strftime("%H:%M:%S"), "icon": "✅",
+                        "text": "Emergency cleared — normal operation resumed"})
+            emergency_on = st.session_state.emergency_active
+
+            # ── FRAME ACQUISITION ────────────────────────────────
+            frame = None
+            cars  = st.session_state.prev_c
+            bikes = st.session_state.prev_b
+
+            if demo_mode:
+                frame, cars, bikes = demo_frame(demo_cars, demo_bikes, night, emergency_on)
+            elif "Webcam" in src:
+                if cam_img is not None:
+                    import io as _io
+                    _pimg = (_PIL_Image or __import__("PIL").Image)
+                    pil_img = _pimg.open(_io.BytesIO(cam_img.getvalue())).convert("RGB")
+                    frame   = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    if st.session_state.yolo_model and n % fskip == 0:
+                        frame, cars, bikes = detect_vehicles_fast(
+                            st.session_state.yolo_model, frame)
+                        st.session_state.prev_c = cars
+                        st.session_state.prev_b = bikes
+                    else:
+                        _hud(frame, cars, bikes)
+                else:
+                    frame = np.full((480, 640, 3), 10, dtype=np.uint8)
+                    cv2.putText(frame, "Click camera button above",
+                                (80, 240), cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 200, 100), 2)
+
+            if frame is None:
+                frame = np.full((400, 560, 3), 10, dtype=np.uint8)
+
+            total = cars + bikes
+            if total > st.session_state.peak: st.session_state.peak = total
+
+            # Incident detection
+            if incident_check(total, st.session_state.prev_total):
+                st.session_state.incident_detected = True
+                st.session_state.total_alerts += 1
                 st.session_state.incident_log.appendleft({
-                    "time": datetime.now().strftime("%H:%M:%S"), "icon": "✅",
-                    "text": "Emergency cleared — normal operation resumed"})
-        emergency_on = st.session_state.emergency_active
+                    "time": datetime.now().strftime("%H:%M:%S"), "icon": "⚠️",
+                    "text": f"Sudden traffic change: {st.session_state.prev_total} → {total} vehicles"})
+            elif n % 30 == 0:
+                st.session_state.incident_detected = False
+            st.session_state.prev_total = total
 
-        # ── FRAME ACQUISITION ────────────────────────────────────────
-        frame = None
-        cars  = st.session_state.prev_c
-        bikes = st.session_state.prev_b
+            # AQI
+            raw_aqi = (int(manual_aqi+55*math.sin(n/30)+20*math.sin(n/8)+random.gauss(0,6))
+                       if aqi_src == "Auto-Simulate" else manual_aqi)
+            raw_aqi = max(0, min(500, raw_aqi))
+            aqi = weather_aqi_correction(raw_aqi, temp, humid, wind)
+            aqi_lbl, aqi_col, aqi_em, aqi_bg = classify_aqi(aqi)
 
-        if demo_mode:
-            frame, cars, bikes = demo_frame(demo_cars, demo_bikes, night, emergency_on)
+            hdf_check = pd.DataFrame(list(st.session_state.history))
+            t_anom, a_anom, z_val = detect_anomaly(hdf_check, total, aqi)
+            if a_anom and n % 15 == 0:
+                st.session_state.incident_log.appendleft({
+                    "time": datetime.now().strftime("%H:%M:%S"), "icon": "🌫️",
+                    "text": f"AQI anomaly z={z_val:.1f}, AQI={aqi}"})
 
-        elif "Webcam" in src:
-            # st.camera_input gives a fresh snapshot each Streamlit rerun
-            if cam_img is not None:
-                import io as _io
-                _pimg = (_PIL_Image or __import__('PIL').Image)
-                pil_img = _pimg.open(_io.BytesIO(cam_img.getvalue())).convert("RGB")
-                frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                if st.session_state.yolo_model and n % fskip == 0:
-                    frame, cars, bikes = detect_vehicles_fast(st.session_state.yolo_model, frame)
-                    st.session_state.prev_c = cars; st.session_state.prev_b = bikes
-                else:
-                    _hud(frame, cars, bikes)
+            t_level, t_col, _ = classify_traffic(total)
+            green_t, dec, sig  = signal_decision(t_level, aqi, emergency_on, night)
+            ped_t = pedestrian_phase(green_t)
+
+            spd = estimate_speed(total, t_level, night)
+            st.session_state.avg_speed = round(0.85*st.session_state.avg_speed + 0.15*spd, 1)
+            st.session_state.speed_history.append(spd)
+            congestion_idx = compute_congestion_index(total, aqi, spd)
+            st.session_state.congestion_index = congestion_idx
+            flow_rate = compute_flow_rate(total, st.session_state.speed_history)
+            if n % 10 == 0:
+                st.session_state.route_status = update_route_status(congestion_idx)
+
+            idle_saved = abs(green_t-30)*0.03
+            st.session_state.idle_time_saved += idle_saved
+            st.session_state.co2_saved = compute_co2(st.session_state.idle_time_saved, max(1,total))
+            st.session_state.total_vehicles_cleared += total
+
+            if n % fskip == 0:
+                cnn_feat = cnn_extract(frame)
+                st.session_state.cnn_feats.append(cnn_feat)
             else:
-                # No snapshot yet — show placeholder
-                frame = np.full((480, 640, 3), 10, dtype=np.uint8)
-                cv2.putText(frame, "Click camera button above to start",
-                            (60, 240), cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 200, 100), 2)
+                cnn_feat = {"edge":0,"hgrad":0,"vgrad":0,"texture":0,"density":0}
 
-        elif "Upload" in src:
-            cap = st.session_state.cap
-            if cap is not None:
-                ret, frame = cap.read()
-                if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0); ret, frame = cap.read()
-                if not ret: break
-                pos  = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-                tot2 = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                if tot2 > 0:
-                    st.sidebar.progress(pos/tot2, text=f"Frame {pos}/{tot2}")
-                if n % fskip == 0:
-                    frame, cars, bikes = detect_vehicles(st.session_state.yolo_model, frame)
-                    st.session_state.prev_c = cars; st.session_state.prev_b = bikes
-                else:
-                    _hud(frame, cars, bikes)
+            tot_hist = [r["total"] for r in st.session_state.history]
+            aqi_hist = [r["aqi"]   for r in st.session_state.history]
+            rnn_pred  = rnn_predict(tot_hist)  if len(tot_hist) > 3 else []
+            lstm_pred = lstm_forecast(aqi_hist) if len(aqi_hist) > 3 else []
+            if rnn_pred:  st.session_state.rnn_last  = rnn_pred[0]
+            if lstm_pred: st.session_state.lstm_last = lstm_pred[-1]
+
+            ann_probs = ann_classify(total, aqi)
+            knn_pred = rf_pred = gbm_pred = "N/A"
+            if n % fskip == 0 and SK_AVAILABLE:
+                if knn_pipe:
+                    try: knn_pred = knn_pipe.predict([[total,aqi]])[0].upper()
+                    except: pass
+                if rf_pipe:
+                    try: rf_pred = rf_pipe.predict([[cars,bikes,aqi,total]])[0].upper()
+                    except: pass
+                if gbm_pipe:
+                    try: gbm_pred = gbm_pipe.predict([[cars,bikes,aqi,total,temp]])[0].upper()
+                    except: pass
+
+            if n % 3 == 0:
+                st.session_state.heatmap_data = update_heatmap(
+                    st.session_state.heatmap_data, total, n)
+
+            eff = compute_efficiency(total, green_t, hdf_check)
+            st.session_state.efficiency_scores.append(eff)
+            lane1 = max(0, total//2+random.randint(-1,1))
+            lane2 = max(0, total-lane1)
+            emerg_int = st.session_state.emergency_intersection if emergency_on else -1
+            int_states = update_intersections(n, emerg_int)
+
+            st.session_state.history.append({
+                "cars":cars,"bikes":bikes,"total":total,"aqi":aqi,
+                "level":t_level,"signal":sig,"green_time":green_t,
+                "efficiency":eff,"co2_saved":st.session_state.co2_saved,
+                "speed":spd,"congestion":congestion_idx,
+            })
+
+            # ── RENDER ───────────────────────────────────────────
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h0, w0 = frame_rgb.shape[:2]
+            if w0 > 560:
+                sc = 560/w0
+                frame_rgb = cv2.resize(frame_rgb, (560, int(h0*sc)))
+            vid_slot.image(frame_rgb, channels="RGB", use_container_width=True, clamp=True)
+
+            if emergency_on:
+                emergency_slot.markdown(
+                    f'<div class="emergency-banner">{st.session_state.emergency_type} — '
+                    f'Priority Override ACTIVE — '
+                    f'{INTERSECTIONS[st.session_state.emergency_intersection]} Cleared — '
+                    f'{st.session_state.emergency_countdown}s remaining</div>',
+                    unsafe_allow_html=True)
             else:
-                frame = np.full((480, 640, 3), 10, dtype=np.uint8)
-                cv2.putText(frame, "Upload a video file and press Start",
-                            (80, 240), cv2.FONT_HERSHEY_SIMPLEX, .7, (0, 180, 255), 2)
+                emergency_slot.empty()
 
-        if frame is None:
-            frame = np.full((480, 640, 3), 10, dtype=np.uint8)
-
-        total = cars + bikes
-        if total > st.session_state.peak: st.session_state.peak = total
-
-        # Incident detection
-        if incident_check(total, st.session_state.prev_total):
-            st.session_state.incident_detected = True
-            st.session_state.total_alerts += 1
-            st.session_state.incident_log.appendleft({"time": datetime.now().strftime("%H:%M:%S"), "icon": "⚠️", "text": f"Sudden traffic change: {st.session_state.prev_total} → {total} vehicles"})
-        elif n % 30 == 0: st.session_state.incident_detected = False
-        st.session_state.prev_total = total
-
-        # AQI
-        raw_aqi = (int(manual_aqi+55*math.sin(n/30)+20*math.sin(n/8)+random.gauss(0, 6)) if aqi_src == "Auto-Simulate" else manual_aqi)
-        raw_aqi = max(0, min(500, raw_aqi)); aqi = weather_aqi_correction(raw_aqi, temp, humid, wind)
-        aqi_lbl, aqi_col, aqi_em, aqi_bg = classify_aqi(aqi)
-
-        # AQI anomaly logging
-        hdf_check = pd.DataFrame(list(st.session_state.history))
-        t_anom, a_anom, z_val = detect_anomaly(hdf_check, total, aqi)
-        if a_anom and n % 15 == 0:
-            st.session_state.incident_log.appendleft({"time": datetime.now().strftime("%H:%M:%S"), "icon": "🌫️", "text": f"AQI anomaly detected — z={z_val:.1f}, current AQI={aqi}"})
-
-        # Signal
-        t_level, t_col, _ = classify_traffic(total)
-        green_t, dec, sig = signal_decision(t_level, aqi, emergency_on, night)
-        ped_t = pedestrian_phase(green_t)
-
-        # NEW: Speed & Congestion
-        spd = estimate_speed(total, t_level, night)
-        st.session_state.avg_speed = round(0.85*st.session_state.avg_speed + 0.15*spd, 1)
-        st.session_state.speed_history.append(spd)
-        congestion_idx = compute_congestion_index(total, aqi, spd)
-        st.session_state.congestion_index = congestion_idx
-        flow_rate = compute_flow_rate(total, st.session_state.speed_history)
-        st.session_state.flow_rate = flow_rate
-
-        # Route advisory
-        if n % 10 == 0:
-            st.session_state.route_status = update_route_status(congestion_idx)
-
-        # CO2
-        idle_saved = abs(green_t-30)*0.03; st.session_state.idle_time_saved += idle_saved
-        st.session_state.co2_saved = compute_co2(st.session_state.idle_time_saved, max(1, total))
-        st.session_state.total_vehicles_cleared += total
-
-        # CNN features
-        if n % fskip == 0:
-            cnn_feat = cnn_extract(frame); st.session_state.cnn_feats.append(cnn_feat)
-        else: cnn_feat = {"edge": 0, "hgrad": 0, "vgrad": 0, "texture": 0, "density": 0}
-
-        # RNN/LSTM
-        tot_hist = [r["total"] for r in st.session_state.history]
-        aqi_hist = [r["aqi"] for r in st.session_state.history]
-        rnn_pred = rnn_predict(tot_hist) if len(tot_hist) > 3 else []
-        lstm_pred = lstm_forecast(aqi_hist) if len(aqi_hist) > 3 else []
-        if rnn_pred: st.session_state.rnn_last = rnn_pred[0]
-        if lstm_pred: st.session_state.lstm_last = lstm_pred[-1]
-
-        # ANN + ML
-        ann_probs = ann_classify(total, aqi)
-        knn_pred = rf_pred = gbm_pred = "N/A"
-        if n % fskip == 0 and SK_AVAILABLE:
-            if knn_pipe:
-                try: knn_pred = knn_pipe.predict([[total, aqi]])[0].upper()
-                except: pass
-            if rf_pipe:
-                try: rf_pred = rf_pipe.predict([[cars, bikes, aqi, total]])[0].upper()
-                except: pass
-            if gbm_pipe:
-                try: gbm_pred = gbm_pipe.predict([[cars, bikes, aqi, total, temp]])[0].upper()
-                except: pass
-
-        # Heatmap update
-        if n % 3 == 0:
-            st.session_state.heatmap_data = update_heatmap(st.session_state.heatmap_data, total, n)
-
-        eff = compute_efficiency(total, green_t, hdf_check)
-        st.session_state.efficiency_scores.append(eff)
-        lane1 = max(0, total//2+random.randint(-1, 1)); lane2 = max(0, total-lane1)
-        emerg_int = st.session_state.emergency_intersection if emergency_on else -1
-        int_states = update_intersections(n, emerg_int)
-
-        st.session_state.history.append({
-            "cars": cars, "bikes": bikes, "total": total, "aqi": aqi,
-            "level": t_level, "signal": sig, "green_time": green_t,
-            "efficiency": eff, "co2_saved": st.session_state.co2_saved,
-            "speed": spd, "congestion": congestion_idx,
-        })
-
-        # ── RENDER ──────────────────────────────────────────────────
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h0, w0 = frame_rgb.shape[:2]
-        if w0 > 560: sc = 560/w0; frame_rgb = cv2.resize(frame_rgb, (560, int(h0*sc)))
-        vid_slot.image(frame_rgb, channels="RGB", use_container_width=True, clamp=True)
-
-        if emergency_on:
-            emergency_slot.markdown(f'<div class="emergency-banner">{st.session_state.emergency_type} — Priority Override ACTIVE — {INTERSECTIONS[st.session_state.emergency_intersection]} Cleared — {st.session_state.emergency_countdown}s remaining</div>', unsafe_allow_html=True)
-        else: emergency_slot.empty()
-
-        if True:  # update every frame for smooth metrics
             ni = "🌙" if night else "☀"; wi = "🌊" if green_wave else "·"
-            is_up2 = getattr(st.session_state, 'is_upload', False)
-            det_mode = "DEMO" if demo_mode else ("YOLO+TILES" if is_up2 else "YOLO-LIVE")
-            # RAM warning
-            if PSUTIL_AVAILABLE:
-                ram_pct = psutil.virtual_memory().percent
-                if ram_pct > 85 and n % 20 == 0:
-                    plt.close('all')  # force free matplotlib RAM
-            status_slot.markdown(f"""<div class="statusbar">
+            det_mode = "DEMO" if demo_mode else "YOLO-LIVE"
+            status_slot.markdown(f'''<div class="statusbar">
               <span>Frame <b>{n}</b> | {det_mode} {ni} {wi}</span>
-              <span>Weather AQI Δ: <b>{aqi-raw_aqi:+d}</b></span>
+              <span>AQI Δ: <b>{aqi-raw_aqi:+d}</b></span>
               <span>Peak: <b>{st.session_state.peak}</b></span>
               <span>Alerts: <b>{st.session_state.total_alerts}</b></span>
               <span>{datetime.now().strftime("%H:%M:%S")}</span>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # METRICS
-            slot_metrics.markdown(f"""
+            slot_metrics.markdown(f'''
             <div class="mgrid">
               <div class="mcard mc-car"><div class="mval">{cars}</div><div class="mlbl">CAR/BUS/TRUCK</div></div>
               <div class="mcard mc-bike"><div class="mval">{bikes}</div><div class="mlbl">BIKE/MOTO</div></div>
@@ -1934,37 +1950,31 @@ if st.session_state.running:
             <div class="mgrid2">
               <div class="mcard mc-co2"><div class="mval" style="font-size:1.2rem">{st.session_state.co2_saved:.3f}</div><div class="mlbl">kg CO2 SAVED</div></div>
               <div class="mcard" style="--card-color:#ff2244;--card-top:#ff2244"><div class="mval" style="font-size:1.2rem">{congestion_idx}</div><div class="mlbl">CONGESTION IDX</div></div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # AQI PANEL
-            slot_aqi.markdown(f"""<div class="aqi-panel" style="border-color:{aqi_col}22;{aqi_bg.replace('background:','background-color:')}">
-              <div style="display:flex;justify-content:space-between;align-items:flex-start">
+            slot_aqi.markdown(f'''<div class="aqi-panel" style="border-color:{aqi_col}22">
+              <div style="display:flex;justify-content:space-between">
                 <div>
-                  <div class="aqi-big" style="color:{aqi_col};text-shadow:0 0 20px {aqi_col}44">{aqi}</div>
-                  <span class="aqi-tag" style="background:{aqi_bg};border:1px solid {aqi_col}44;color:{aqi_col}">{aqi_em} {aqi_lbl}</span>
-                  <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;margin-top:6px">
-                    Raw: {raw_aqi} &nbsp;|&nbsp; Weather Δ: <b style="color:#ff6b00">{aqi-raw_aqi:+d}</b>
-                  </div>
-                  <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;margin-top:3px">
-                    LSTM Forecast 2h: <b style="color:#bf5fff">{st.session_state.lstm_last:.0f} AQI</b>
+                  <div class="aqi-big" style="color:{aqi_col}">{aqi}</div>
+                  <span class="aqi-tag" style="color:{aqi_col}">{aqi_em} {aqi_lbl}</span>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#4a5568;margin-top:6px">
+                    Raw:{raw_aqi} Δ:<b style="color:#ff6b00">{aqi-raw_aqi:+d}</b>
+                    &nbsp;|&nbsp; LSTM:<b style="color:#bf5fff">{st.session_state.lstm_last:.0f}</b>
                   </div>
                 </div>
-                <div style="text-align:right;font-family:'Share Tech Mono',monospace;font-size:.68rem;color:#4a5568;line-height:1.9">
-                  <div>WIND <b style="color:#ff6b00">{wind} km/h</b></div>
+                <div style="font-family:Share Tech Mono,monospace;font-size:.68rem;color:#4a5568;text-align:right;line-height:2">
+                  <div>WIND <b style="color:#ff6b00">{wind}km/h</b></div>
                   <div>TEMP <b style="color:#ff6b00">{temp}°C</b></div>
                   <div>HUM <b style="color:#ff6b00">{humid}%</b></div>
-                  <div>PED <b style="color:#00d4ff">{ped_t}s</b></div>
                 </div>
               </div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # SIGNAL PANEL with traffic light visual
-            se = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
             pcls = "sig-emergency" if emergency_on else f"sig-{sig}"
-            r_cls = "tl-red-on" if (sig == "red" or emergency_on) else "tl-red-off"
-            y_cls = "tl-yellow-on" if sig == "yellow" else "tl-yellow-off"
-            g_cls = "tl-green-on" if sig == "green" and not emergency_on else "tl-green-off"
-            slot_sig.markdown(f"""<div class="sig-panel {pcls}">
+            r_cls = "tl-red-on"    if (sig=="red" or emergency_on) else "tl-red-off"
+            y_cls = "tl-yellow-on" if sig=="yellow"                 else "tl-yellow-off"
+            g_cls = "tl-green-on"  if (sig=="green" and not emergency_on) else "tl-green-off"
+            slot_sig.markdown(f'''<div class="sig-panel {pcls}">
               <div class="tl-wrap">
                 <div class="tl-housing">
                   <div class="tl-light {r_cls}"></div>
@@ -1975,247 +1985,200 @@ if st.session_state.running:
                   <div class="sig-lbl">{"EMERGENCY OVERRIDE" if emergency_on else "SIGNAL DURATION"}</div>
                   <div class="sig-time">{green_t}s</div>
                   <div class="sig-lbl">TRAFFIC: <b>{t_level.upper()}</b></div>
-                  <div style="font-size:.82rem;color:#a0aec0;margin-top:4px;line-height:1.5">{dec}</div>
-                  <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;margin-top:6px">
-                    PED: {ped_t}s &nbsp;|&nbsp; Night: {"ON" if night else "OFF"} &nbsp;|&nbsp; Wave: {"ON" if green_wave else "OFF"}
+                  <div style="font-size:.82rem;color:#a0aec0;margin-top:4px">{dec}</div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#4a5568;margin-top:6px">
+                    PED:{ped_t}s Night:{"ON" if night else "OFF"} Wave:{"ON" if green_wave else "OFF"}
                   </div>
                 </div>
               </div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # LANES + PEDESTRIAN
             cap2 = max(1, demo_cars+demo_bikes+4)
-            l1p = min(100, int(lane1/cap2*100)); l2p = min(100, int(lane2/cap2*100))
-            def lc(p):
-                return ("#00ff88" if p < 50 else "#ffd700" if p < 80 else "#ff2244")
-            slot_lanes.markdown(f"""
+            l1p  = min(100, int(lane1/cap2*100))
+            l2p  = min(100, int(lane2/cap2*100))
+            def lc(p): return("#00ff88" if p<50 else "#ffd700" if p<80 else "#ff2244")
+            slot_lanes.markdown(f'''
             <div class="lane-wrap">
               <div class="lane-label">LANE A — INBOUND — {lane1} vehicles</div>
-              <div class="lane-track"><div class="lane-fill" style="width:{l1p}%;background:linear-gradient(90deg,{lc(l1p)},{lc(l1p)}88)"></div></div>
+              <div class="lane-track"><div class="lane-fill" style="width:{l1p}%;background:{lc(l1p)}"></div></div>
               <div class="lane-pct" style="color:{lc(l1p)}">{l1p}%</div>
             </div>
             <div class="lane-wrap" style="margin-top:10px">
               <div class="lane-label">LANE B — OUTBOUND — {lane2} vehicles</div>
-              <div class="lane-track"><div class="lane-fill" style="width:{l2p}%;background:linear-gradient(90deg,{lc(l2p)},{lc(l2p)}88)"></div></div>
+              <div class="lane-track"><div class="lane-fill" style="width:{l2p}%;background:{lc(l2p)}"></div></div>
               <div class="lane-pct" style="color:{lc(l2p)}">{l2p}%</div>
             </div>
-            <div style="background:rgba(0,212,255,0.06);border:1px solid rgba(0,212,255,0.2);border-radius:8px;padding:10px 14px;margin-top:12px">
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#00d4ff;letter-spacing:2px">PEDESTRIAN PHASE</div>
-              <div style="font-family:'Orbitron',monospace;font-size:1.6rem;font-weight:800;color:#00d4ff;text-shadow:0 0 12px rgba(0,212,255,.4)">{ped_t}s</div>
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.58rem;color:#4a5568">20% OF GREEN TIME</div>
-            </div>""", unsafe_allow_html=True)
+            <div style="background:rgba(0,212,255,.06);border:1px solid rgba(0,212,255,.2);
+                        border-radius:8px;padding:10px 14px;margin-top:12px;text-align:center">
+              <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#00d4ff">PEDESTRIAN</div>
+              <div style="font-family:Orbitron,monospace;font-size:1.6rem;font-weight:800;color:#00d4ff">{ped_t}s</div>
+            </div>''', unsafe_allow_html=True)
 
-            # 4-INTERSECTION GRID
-            pe = {"GREEN": "🟢", "YELLOW": "🟡", "RED": "🔴", "EMERGENCY": "🚨"}
+            pe = {"GREEN":"🟢","YELLOW":"🟡","RED":"🔴","EMERGENCY":"🚨"}
             ihtml = '<div class="intersection-grid">'
-            for i, (phase, timer, style) in enumerate(int_states):
-                wn = f'<div style="font-family:monospace;font-size:.54rem;color:#4a5568">+{i*15}s offset</div>' if green_wave and i > 0 else ""
-                ihtml += f'<div class="int-card {style}"><div class="int-name">{INTERSECTIONS[i]}</div><div class="int-signal">{pe.get(phase,"🔴")}</div><div class="int-time" style="color:{INT_COLORS[i]};text-shadow:0 0 8px {INT_COLORS[i]}66">{timer}s</div><div style="font-family:monospace;font-size:.56rem;color:#4a5568">{phase}</div>{wn}</div>'
+            for i,(phase,timer,style) in enumerate(int_states):
+                wn = (f'<div style="font-size:.5rem;color:#4a5568">+{i*15}s</div>'
+                      if green_wave and i>0 else "")
+                ihtml += (f'<div class="int-card {style}">'
+                          f'<div class="int-name">{INTERSECTIONS[i]}</div>'
+                          f'<div class="int-signal">{pe.get(phase,"🔴")}</div>'
+                          f'<div class="int-time" style="color:{INT_COLORS[i]}">{timer}s</div>'
+                          f'<div style="font-size:.56rem;color:#4a5568">{phase}</div>{wn}</div>')
             ihtml += "</div>"
-            if green_wave: ihtml += '<div style="font-family:monospace;font-size:.62rem;color:#00ff88;margin-top:6px;text-shadow:0 0 8px rgba(0,255,136,.4)">🌊 Green Wave Active — 15s stagger</div>'
             slot_intersections.markdown(ihtml, unsafe_allow_html=True)
 
-            # SPEED & CONGESTION (ring + speed card)
-            cx = 44; r_ring = 40; circ = 2*math.pi*r_ring
-            dash = round(congestion_idx/100*circ, 1); gap = round(circ-dash, 1)
-            ci_col = "#00ff88" if congestion_idx < 30 else "#ffd700" if congestion_idx < 60 else "#ff2244"
-            slot_speed.markdown(f"""
+            r_ring=40; circ=2*math.pi*r_ring
+            dash=round(congestion_idx/100*circ,1); gap=round(circ-dash,1)
+            ci_col="#00ff88" if congestion_idx<30 else "#ffd700" if congestion_idx<60 else "#ff2244"
+            slot_speed.markdown(f'''
             <div class="speed-gauge" style="margin-bottom:10px">
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;letter-spacing:2px">AVG SPEED</div>
+              <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#4a5568">AVG SPEED</div>
               <div class="speed-val">{st.session_state.avg_speed} <span style="font-size:1rem">km/h</span></div>
-              <div style="height:4px;background:rgba(255,255,255,.05);border-radius:2px;margin:8px 0;overflow:hidden">
-                <div style="height:100%;width:{min(100,int(st.session_state.avg_speed/90*100))}%;background:linear-gradient(90deg,#ffd700,#ff6b00)"></div>
-              </div>
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.58rem;color:#4a5568">RNN Forecast: <b style="color:#00d4ff">{st.session_state.rnn_last:.1f} veh/frame</b></div>
             </div>
-            <div style="background:rgba(13,20,33,.9);border:1px solid rgba(255,107,0,.15);border-radius:12px;padding:14px;text-align:center">
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;letter-spacing:2px;margin-bottom:8px">CONGESTION INDEX</div>
+            <div style="background:rgba(13,20,33,.9);border:1px solid rgba(255,107,0,.15);
+                        border-radius:12px;padding:14px;text-align:center">
+              <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#4a5568;margin-bottom:8px">CONGESTION INDEX</div>
               <div class="congestion-ring">
                 <svg class="cring-svg" width="90" height="90" viewBox="0 0 90 90">
                   <circle cx="45" cy="45" r="{r_ring}" fill="none" stroke="rgba(255,255,255,.05)" stroke-width="8"/>
                   <circle cx="45" cy="45" r="{r_ring}" fill="none" stroke="{ci_col}" stroke-width="8"
-                    stroke-dasharray="{dash} {gap}" stroke-linecap="round"
-                    style="filter:drop-shadow(0 0 6px {ci_col})"/>
+                    stroke-dasharray="{dash} {gap}" stroke-linecap="round"/>
                 </svg>
                 <div class="cring-val">
-                  <div class="cring-num" style="color:{ci_col};text-shadow:0 0 10px {ci_col}88">{congestion_idx}</div>
+                  <div class="cring-num" style="color:{ci_col}">{congestion_idx}</div>
                   <div class="cring-lbl">/ 100</div>
                 </div>
               </div>
-              <div style="font-family:'Share Tech Mono',monospace;font-size:.62rem;color:{ci_col};margin-top:6px">
+              <div style="font-family:Share Tech Mono,monospace;font-size:.62rem;color:{ci_col};margin-top:6px">
                 {"FREE FLOW" if congestion_idx<30 else "MODERATE" if congestion_idx<60 else "CONGESTED"}
               </div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # ROUTE ADVISORY
-            rs = st.session_state.route_status
-            rcls = {"FREE": "route-free", "MODERATE": "route-mod", "JAM": "route-jam"}
-            rtime = {"FREE": f"{random.randint(8,14)} min", "MODERATE": f"{random.randint(18,28)} min", "JAM": f"{random.randint(35,55)} min"}
-            route_html = '<div class="route-card">'
+            rs    = st.session_state.route_status
+            rcls  = {"FREE":"route-free","MODERATE":"route-mod","JAM":"route-jam"}
+            rtime = {"FREE":f"{random.randint(8,14)} min",
+                     "MODERATE":f"{random.randint(18,28)} min",
+                     "JAM":f"{random.randint(35,55)} min"}
+            rhtml = '<div class="route-card">'
             for route, status in rs.items():
-                short = route.replace("Via ", "").replace("Highway ", "").replace("Road", "Rd").replace("Centre", "Ctr")
-                route_html += f'<div class="route-item"><span class="route-name">{short}</span><span class="route-status {rcls[status]}">{status}</span><span class="route-time">{rtime[status]}</span></div>'
-            route_html += "</div>"
-            slot_route.markdown(route_html, unsafe_allow_html=True)
+                short = route.replace("Via ","").replace("Highway ","")
+                rhtml += (f'<div class="route-item">'
+                          f'<span class="route-name">{short}</span>'
+                          f'<span class="route-status {rcls[status]}">{status}</span>'
+                          f'<span class="route-time">{rtime[status]}</span></div>')
+            slot_route.markdown(rhtml+"</div>", unsafe_allow_html=True)
 
-            # ML OUTPUTS
-            best_ann = max(ann_probs, key=ann_probs.get)
-            ac = {"GREEN": "#00ff88", "YELLOW": "#ffd700", "RED": "#ff2244"}
-            cnn_edge = st.session_state.cnn_feats[-1]["edge"] if st.session_state.cnn_feats else "--"
-            ml_items = [
-                ("CNN EDGE DENSITY", str(cnn_edge), "#ff6b00"),
-                ("RNN NEXT FRAME", f"{st.session_state.rnn_last:.1f} veh", "#00d4ff"),
-                ("LSTM AQI 2H", f"{st.session_state.lstm_last:.0f}", "#bf5fff"),
-                (f"ANN → {best_ann}", f"{ann_probs[best_ann]:.0%} conf", ac.get(best_ann, "#ff6b00")),
+            best_ann  = max(ann_probs, key=ann_probs.get)
+            ac = {"GREEN":"#00ff88","YELLOW":"#ffd700","RED":"#ff2244"}
+            cnn_edge  = st.session_state.cnn_feats[-1]["edge"] if st.session_state.cnn_feats else "--"
+            ml_items  = [
+                ("CNN EDGE",  str(cnn_edge), "#ff6b00"),
+                ("RNN NEXT",  f"{st.session_state.rnn_last:.1f} veh","#00d4ff"),
+                ("LSTM AQI",  f"{st.session_state.lstm_last:.0f}","#bf5fff"),
+                (f"ANN→{best_ann}", f"{ann_probs[best_ann]:.0%}", ac.get(best_ann,"#ff6b00")),
                 ("KNN (k=5)", knn_pred, "#00ff88"),
-                ("RANDOM FOREST", rf_pred, "#00ff88"),
-                ("GRADIENT BOOST", gbm_pred, "#00d4ff"),
+                ("RF 120T",   rf_pred,  "#00ff88"),
+                ("GBM 80T",   gbm_pred, "#00d4ff"),
             ]
-            slot_ml.markdown('<div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">'+"".join(f'<div class="mlrow"><div class="mlrow-lbl">{lb}</div><div class="mlrow-val" style="color:{col}">{val}</div></div>' for lb, val, col in ml_items)+"</div>", unsafe_allow_html=True)
+            slot_ml.markdown(
+                '<div style="display:grid;grid-template-columns:1fr 1fr;gap:7px">'
+                +"".join(f'<div class="mlrow"><div class="mlrow-lbl">{lb}</div>'
+                         f'<div class="mlrow-val" style="color:{col}">{val}</div></div>'
+                         for lb,val,col in ml_items)
+                +"</div>", unsafe_allow_html=True)
 
-            # PREDICTION ACCURACY
             pa = st.session_state.pred_accuracy
-            # Slightly vary accuracy for realism
             if n % 20 == 0:
-                pa["KNN"] = round(min(99, pa["KNN"] + random.gauss(0, 0.3)), 1)
-                pa["RF"] = round(min(99, pa["RF"] + random.gauss(0, 0.2)), 1)
-                pa["GBM"] = round(min(99, pa["GBM"] + random.gauss(0, 0.15)), 1)
-                pa["ANN"] = round(min(99, pa["ANN"] + random.gauss(0, 0.4)), 1)
-            acc_html = ""
-            for model_name, acc_val in pa.items():
-                acc_col = "#00ff88" if acc_val > 90 else "#ffd700" if acc_val > 80 else "#ff6b00"
-                acc_html += f"""<div class="acc-bar">
-                  <div class="acc-name">{model_name} ACCURACY</div>
-                  <div class="acc-track"><div class="acc-fill" style="width:{acc_val}%"></div></div>
-                  <div class="acc-pct" style="color:{acc_col}">{acc_val:.1f}%</div>
-                </div>"""
+                pa["KNN"] = round(min(99,pa["KNN"]+random.gauss(0,.3)),1)
+                pa["RF"]  = round(min(99,pa["RF"] +random.gauss(0,.2)),1)
+                pa["GBM"] = round(min(99,pa["GBM"]+random.gauss(0,.15)),1)
+                pa["ANN"] = round(min(99,pa["ANN"]+random.gauss(0,.4)),1)
+            acc_html = "".join(
+                f'<div class="acc-bar"><div class="acc-name">{m}</div>'
+                f'<div class="acc-track"><div class="acc-fill" style="width:{v}%"></div></div>'
+                f'<div class="acc-pct" style="color:{"#00ff88" if v>90 else "#ffd700" if v>80 else "#ff6b00"}">{v:.1f}%</div></div>'
+                for m,v in pa.items())
             slot_acc.markdown(acc_html, unsafe_allow_html=True)
 
-            # ALERTS
             anom_html = ""
-            if t_anom: anom_html += f'<div class="anomaly-card critical">⚡ TRAFFIC ANOMALY — Z={z_val:.1f} — Count {total} is statistically unusual!</div>'
-            if a_anom: anom_html += f'<div class="anomaly-card">🌫️ AQI ANOMALY — Z={z_val:.1f} — Pollution spike AQI {aqi} detected!</div>'
-            if st.session_state.incident_detected: anom_html += '<div class="anomaly-card critical">🚧 INCIDENT ALERT — Sudden vehicle count change. Possible accident!</div>'
-            al_t = "al-crit" if aqi > 200 or total > 20 else "al-warn" if aqi > 150 or total > 12 else "al-ok"
-            slot_alerts.markdown(f"""{anom_html}
-            <div class="{al_t}">{"⛔ CRITICAL" if aqi>200 else "⚠️ ELEVATED" if aqi>150 else "✅ NORMAL"} — AQI {aqi} — {total} veh</div>
-            <div class="al-info" style="margin-top:4px;font-size:.82rem">
-              KNN: {knn_pred} &nbsp;|&nbsp; RF: {rf_pred} &nbsp;|&nbsp; GBM: {gbm_pred}<br>
-              ANN: G={ann_probs.get("GREEN",0):.0%} Y={ann_probs.get("YELLOW",0):.0%} R={ann_probs.get("RED",0):.0%}
-            </div>""", unsafe_allow_html=True)
+            if t_anom: anom_html += f'<div class="anomaly-card critical">⚡ TRAFFIC ANOMALY Z={z_val:.1f}</div>'
+            if a_anom: anom_html += f'<div class="anomaly-card">🌫️ AQI ANOMALY Z={z_val:.1f} AQI={aqi}</div>'
+            if st.session_state.incident_detected:
+                anom_html += '<div class="anomaly-card critical">🚧 INCIDENT ALERT</div>'
+            al_t = ("al-crit" if aqi>200 or total>20 else
+                    "al-warn" if aqi>150 or total>12 else "al-ok")
+            slot_alerts.markdown(
+                f'{anom_html}<div class="{al_t}">'
+                f'{"⛔ CRITICAL" if aqi>200 else "⚠️ ELEVATED" if aqi>150 else "✅ NORMAL"}'
+                f' — AQI {aqi} — {total} veh</div>'
+                f'<div class="al-info" style="font-size:.82rem">'
+                f'KNN:{knn_pred} RF:{rf_pred} GBM:{gbm_pred}<br>'
+                f'ANN: G={ann_probs.get("GREEN",0):.0%} Y={ann_probs.get("YELLOW",0):.0%} R={ann_probs.get("RED",0):.0%}</div>',
+                unsafe_allow_html=True)
 
-            # EFFICIENCY
-            avg_eff = sum(st.session_state.efficiency_scores)/max(1, len(st.session_state.efficiency_scores))
-            eb = min(100, int(avg_eff)); ec = "#00ff88" if avg_eff > 70 else "#ffd700" if avg_eff > 40 else "#ff2244"
+            avg_eff = sum(st.session_state.efficiency_scores)/max(1,len(st.session_state.efficiency_scores))
+            eb = min(100,int(avg_eff))
+            ec = "#00ff88" if avg_eff>70 else "#ffd700" if avg_eff>40 else "#ff2244"
             uptime = int((datetime.now()-st.session_state.session_start).total_seconds())
-            slot_efficiency.markdown(f"""<div class="eff-card">
+            slot_efficiency.markdown(f'''<div class="eff-card">
               <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:center">
                 <div>
-                  <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:#4a5568;letter-spacing:2px">SESSION EFFICIENCY</div>
-                  <div class="eff-score">{avg_eff:.1f}<span style="font-size:1.3rem;color:#4a5568"> / 100</span></div>
-                  <div class="eff-bar"><div class="eff-fill" style="width:{eb}%;background:linear-gradient(90deg,{ec},{ec}88)"></div></div>
+                  <div style="font-family:Share Tech Mono,monospace;font-size:.6rem;color:#4a5568">EFFICIENCY</div>
+                  <div class="eff-score">{avg_eff:.1f}<span style="font-size:1.3rem;color:#4a5568"> /100</span></div>
+                  <div class="eff-bar"><div class="eff-fill" style="width:{eb}%;background:{ec}"></div></div>
                 </div>
                 <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:10px 6px">
-                    <div style="font-family:'Orbitron',monospace;font-size:1.2rem;font-weight:800;color:#00ff88">{st.session_state.co2_saved:.3f}</div>
-                    <div style="font-family:'Share Tech Mono',monospace;font-size:.55rem;color:#4a5568;margin-top:3px">kg CO2 SAVED</div>
+                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:8px">
+                    <div style="font-family:Orbitron,monospace;font-size:1.1rem;font-weight:800;color:#00ff88">{st.session_state.co2_saved:.3f}</div>
+                    <div style="font-family:Share Tech Mono,monospace;font-size:.5rem;color:#4a5568">kg CO2</div>
                   </div>
-                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:10px 6px">
-                    <div style="font-family:'Orbitron',monospace;font-size:1.2rem;font-weight:800;color:#ff6b00">{st.session_state.total_vehicles_cleared}</div>
-                    <div style="font-family:'Share Tech Mono',monospace;font-size:.55rem;color:#4a5568;margin-top:3px">VEH CLEARED</div>
+                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:8px">
+                    <div style="font-family:Orbitron,monospace;font-size:1.1rem;font-weight:800;color:#ff6b00">{st.session_state.total_vehicles_cleared}</div>
+                    <div style="font-family:Share Tech Mono,monospace;font-size:.5rem;color:#4a5568">CLEARED</div>
                   </div>
-                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:10px 6px">
-                    <div style="font-family:'Orbitron',monospace;font-size:1.2rem;font-weight:800;color:#00d4ff">{uptime}s</div>
-                    <div style="font-family:'Share Tech Mono',monospace;font-size:.55rem;color:#4a5568;margin-top:3px">UPTIME</div>
+                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:8px">
+                    <div style="font-family:Orbitron,monospace;font-size:1.1rem;font-weight:800;color:#00d4ff">{uptime}s</div>
+                    <div style="font-family:Share Tech Mono,monospace;font-size:.5rem;color:#4a5568">UPTIME</div>
                   </div>
-                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:10px 6px">
-                    <div style="font-family:'Orbitron',monospace;font-size:1.2rem;font-weight:800;color:#bf5fff">{st.session_state.frames_done}</div>
-                    <div style="font-family:'Share Tech Mono',monospace;font-size:.55rem;color:#4a5568;margin-top:3px">FRAMES</div>
+                  <div style="text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:8px">
+                    <div style="font-family:Orbitron,monospace;font-size:1.1rem;font-weight:800;color:#bf5fff">{st.session_state.frames_done}</div>
+                    <div style="font-family:Share Tech Mono,monospace;font-size:.5rem;color:#4a5568">FRAMES</div>
                   </div>
                 </div>
               </div>
-            </div>""", unsafe_allow_html=True)
+            </div>''', unsafe_allow_html=True)
 
-            # INCIDENT LOG
             log_html = '<div class="incident-log">'
             if st.session_state.incident_log:
                 for item in st.session_state.incident_log:
-                    log_html += f'<div class="incident-item"><span class="incident-time">{item["time"]}</span><span class="incident-icon">{item["icon"]}</span><span class="incident-text">{item["text"]}</span></div>'
+                    log_html += (f'<div class="incident-item">'
+                                 f'<span class="incident-time">{item["time"]}</span>'
+                                 f'<span class="incident-icon">{item["icon"]}</span>'
+                                 f'<span class="incident-text">{item["text"]}</span></div>')
             else:
-                log_html += '<div style="font-family:monospace;font-size:.75rem;color:#4a5568;padding:12px 0;text-align:center">No incidents logged</div>'
-            log_html += "</div>"
-            slot_incidents.markdown(log_html, unsafe_allow_html=True)
+                log_html += '<div style="color:#4a5568;padding:12px;text-align:center">No incidents</div>'
+            slot_incidents.markdown(log_html+"</div>", unsafe_allow_html=True)
 
-        # Chart updates
-        # Close all stale matplotlib figures to free RAM
-        if n % 3 == 0:
-            plt.close('all')
+            # Chart updates every 40 frames + RAM cleanup
+            if n % 3  == 0: plt.close("all")
+            if n % 20 == 0: import gc; gc.collect()
+            if n % 40 == 0 and len(st.session_state.history) > 5:
+                hdf = pd.DataFrame(list(st.session_state.history))
+                live_scatter.pyplot(chart_scatter(hdf), use_container_width=True)
+                live_series.pyplot(chart_timeseries(hdf), use_container_width=True)
+                live_cnn.pyplot(chart_cnn(st.session_state.cnn_feats), use_container_width=True)
+                live_rnn.pyplot(chart_rnn_lstm(hdf,lstm_pred,rnn_pred), use_container_width=True)
+                live_ann.pyplot(chart_ann(ann_probs), use_container_width=True)
+                live_knn.pyplot(chart_knn(knn_pipe,knn_df,total,aqi), use_container_width=True)
+                live_km.pyplot(chart_kmeans(km_model,km_df,total,aqi), use_container_width=True)
+                live_rf.pyplot(chart_gbm_compare(rf_pipe,gbm_pipe), use_container_width=True)
+                live_sighist.pyplot(chart_signal_history(hdf), use_container_width=True)
+                live_eff.pyplot(chart_efficiency(hdf), use_container_width=True)
+                live_corr.pyplot(chart_correlation_matrix(hdf), use_container_width=True)
+                live_spdflo.pyplot(chart_speed_flow(hdf), use_container_width=True)
+                live_heatmap.pyplot(chart_heatmap(st.session_state.heatmap_data), use_container_width=True)
 
-        if n % 40 == 0 and len(st.session_state.history) > 5:
-            hdf = pd.DataFrame(list(st.session_state.history))
-            live_scatter.pyplot(chart_scatter(hdf), use_container_width=True)
-            live_series.pyplot(chart_timeseries(hdf), use_container_width=True)
-            live_cnn.pyplot(chart_cnn(st.session_state.cnn_feats), use_container_width=True)
-            live_rnn.pyplot(chart_rnn_lstm(hdf, lstm_pred, rnn_pred), use_container_width=True)
-            live_ann.pyplot(chart_ann(ann_probs), use_container_width=True)
-            live_knn.pyplot(chart_knn(knn_pipe, knn_df, total, aqi), use_container_width=True)
-            live_km.pyplot(chart_kmeans(km_model, km_df, total, aqi), use_container_width=True)
-            live_rf.pyplot(chart_gbm_compare(rf_pipe, gbm_pipe), use_container_width=True)
-            live_sighist.pyplot(chart_signal_history(hdf), use_container_width=True)
-            live_eff.pyplot(chart_efficiency(hdf), use_container_width=True)
-            live_corr.pyplot(chart_correlation_matrix(hdf), use_container_width=True)
-            live_spdflo.pyplot(chart_speed_flow(hdf), use_container_width=True)
-            live_heatmap.pyplot(chart_heatmap(st.session_state.heatmap_data), use_container_width=True)
+            time.sleep(0.05)
 
-        # Adaptive sleep
-        if demo_mode:
-            time.sleep(0.025)
-        elif getattr(st.session_state, 'is_upload', False):
-            # Match video FPS
-            cap_fps = st.session_state.cap.get(cv2.CAP_PROP_FPS) if st.session_state.cap else 25
-            target_fps = max(8, min(30, cap_fps))
-            time.sleep(max(0.005, 1.0/target_fps - 0.03))
-        else:
-            # Webcam — minimal sleep for lowest latency
-            time.sleep(0.01)
-
-    if st.session_state.running: st.rerun()
-
-else:
-    # IDLE PLACEHOLDER
-    ph = np.full((360, 560, 3), 7, dtype=np.uint8)
-    ph[:, :, 2] = 20  # slight blue tint for dark bg
-    # Grid lines
-    for x in range(0, 560, 40):
-        for y in range(0, 360, 40):
-            ph[y, x] = [20, 22, 28]
-    # Horizontal lines
-    for y in range(0, 360, 40): ph[y, :] = [14, 18, 25]
-    # Vertical lines
-    for x in range(0, 560, 40): ph[:, x] = [14, 18, 25]
-
-    cv2.putText(ph, "TrafficIQ  v7.0", (68, 110), cv2.FONT_HERSHEY_SIMPLEX, 1.25, (200, 110, 0), 3)
-    cv2.putText(ph, "Sanket Sutar", (165, 152), cv2.FONT_HERSHEY_SIMPLEX, .75, (160, 75, 0), 2)
-    cv2.putText(ph, "9 Algorithms: CNN  RNN  LSTM  ANN  KNN  KMeans  RF  GBM", (16, 190), cv2.FONT_HERSHEY_SIMPLEX, .38, (0, 160, 180), 1)
-    cv2.putText(ph, "Multi-Intersection  |  Emergency Override  |  CO2 Tracker", (16, 212), cv2.FONT_HERSHEY_SIMPLEX, .37, (0, 180, 80), 1)
-    cv2.putText(ph, "Speed Estimator  |  Congestion Index  |  Route Advisory", (16, 232), cv2.FONT_HERSHEY_SIMPLEX, .37, (0, 180, 80), 1)
-    cv2.putText(ph, "Incident Log  |  Pred Accuracy  |  Density Heatmap", (16, 252), cv2.FONT_HERSHEY_SIMPLEX, .37, (0, 180, 80), 1)
-    cv2.putText(ph, "Press  START DETECTION  to begin", (90, 300), cv2.FONT_HERSHEY_SIMPLEX, .65, (100, 100, 120), 1)
-
-    vid_slot.image(cv2.cvtColor(ph, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-    slot_metrics.markdown('<div class="mgrid"><div class="mcard mc-car"><div class="mval">—</div><div class="mlbl">CARS</div></div><div class="mcard mc-bike"><div class="mval">—</div><div class="mlbl">BIKES</div></div><div class="mcard mc-tot"><div class="mval">—</div><div class="mlbl">TOTAL</div></div><div class="mcard mc-aqi"><div class="mval">—</div><div class="mlbl">AQI</div></div></div>', unsafe_allow_html=True)
-    mode_hint = "📷 Select Webcam → allow camera → press Start" if "Webcam" in src else ("📁 Upload video → press Start" if "Upload" in src else "▶ Press Start Detection below")
-    slot_sig.markdown(f'<div class="sig-panel sig-green"><div class="tl-wrap"><div class="tl-housing"><div class="tl-light tl-red-off"></div><div class="tl-light tl-yellow-off"></div><div class="tl-light tl-green-off"></div></div><div class="tl-info"><div class="sig-time">—</div><div class="sig-lbl">{mode_hint}</div></div></div></div>', unsafe_allow_html=True)
-    slot_alerts.markdown('<div class="al-ok">✅ TrafficIQ v7.0 ready — 9 algorithms loaded — Sanket Sutar</div>', unsafe_allow_html=True)
-    slot_incidents.markdown('<div class="incident-log"><div style="font-family:monospace;font-size:.75rem;color:#4a5568;padding:12px;text-align:center">Incident log will appear here</div></div>', unsafe_allow_html=True)
-    slot_intersections.markdown('<div class="intersection-grid">'+"".join(f'<div class="int-card"><div class="int-name">{INTERSECTIONS[i]}</div><div class="int-signal">⚫</div><div class="int-time" style="color:#4a5568">—</div></div>' for i in range(4))+"</div>", unsafe_allow_html=True)
-
-# ─── FOOTER ──────────────────────────────────────────────────────────────────
-st.markdown("""<div class="footer">
-  <div style="font-family:'Orbitron',monospace;font-size:.9rem;font-weight:700;margin-bottom:6px;color:#e8ecf1">
-    Traffic<span>IQ</span> <span style="color:#00d4ff">v7.0</span> — Smart Traffic Signalling with AQI Prediction
-  </div>
-  <div>Prepared by <span>Sanket Sutar</span> &nbsp;·&nbsp; B.E. Final Year Project &nbsp;·&nbsp; 2025-26</div>
-  <div style="margin-top:4px">YOLOv8 CNN · RNN · LSTM · ANN · KNN · KMeans · Random Forest · GBM · Speed Estimator · Congestion Index · Route Advisory · Incident Log</div>
-</div>""", unsafe_allow_html=True)
+        if st.session_state.running: st.rerun()
 

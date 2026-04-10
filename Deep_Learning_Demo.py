@@ -2178,7 +2178,6 @@ if st.session_state.running:
                 live_spdflo.pyplot(chart_speed_flow(hdf), use_container_width=True)
                 live_heatmap.pyplot(chart_heatmap(st.session_state.heatmap_data), use_container_width=True)
 
-            time.sleep(0.05)
+            time.sleep(0.025 if demo_mode else 0.01)
 
         if st.session_state.running: st.rerun()
-
